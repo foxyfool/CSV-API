@@ -1,159 +1,92 @@
-import { Injectable, Inject, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  Logger,
+} from '@nestjs/common';
 import { SupabaseClient } from '@supabase/supabase-js';
 import * as csv from 'csv-parse';
 import { Transform, pipeline } from 'stream';
 import { promisify } from 'util';
 import { Readable } from 'stream';
-import { ProcessingResult } from '../interfaces/csv-processor.interface';
+import {
+  CsvPreviewStats,
+  ProcessingOptions,
+} from '../interfaces/csv-processor.interface';
+
 @Injectable()
 export class CsvProcessorService {
   private readonly logger = new Logger(CsvProcessorService.name);
-
   private readonly BUCKET_NAME = 'csv-files';
-  private readonly RESULTS_FOLDER = 'results';
 
   constructor(
     @Inject('SUPABASE_CLIENT')
     private readonly supabase: SupabaseClient,
   ) {}
 
-  async onModuleInit() {
-    await this.ensureBucketExists();
-  }
-
-  private async ensureBucketExists() {
-    try {
-      const { data: buckets } = await this.supabase.storage.listBuckets();
-
-      const bucketExists = buckets?.some(
-        (bucket) => bucket.name === this.BUCKET_NAME,
-      );
-
-      if (!bucketExists) {
-        const { data, error } = await this.supabase.storage.createBucket(
-          this.BUCKET_NAME,
-          {
-            public: false,
-            fileSizeLimit: 10485760, // 10MB
-          },
-        );
-
-        if (error) {
-          throw error;
-        }
-
-        this.logger.log(`Created bucket: ${this.BUCKET_NAME}`);
-      }
-
-      await Promise.all([
-        this.supabase.storage
-          .from(this.BUCKET_NAME)
-          .upload('uploads/.keep', new Uint8Array(0), {
-            upsert: true,
-          }),
-        this.supabase.storage
-          .from(this.BUCKET_NAME)
-          .upload(`${this.RESULTS_FOLDER}/.keep`, new Uint8Array(0), {
-            upsert: true,
-          }),
-      ]);
-    } catch (error) {
-      this.logger.error(`Failed to ensure bucket exists: ${error.message}`);
-      throw error;
-    }
-  }
-
-  async processAndStoreCSV(
-    fileBuffer: Buffer,
-    originalFilename: string,
-    emailColumn: string = 'email',
-    firstNameColumn: string = 'first_name',
-    lastNameColumn: string = 'last_name',
-  ): Promise<ProcessingResult> {
-    try {
-      await this.ensureBucketExists();
-
-      const safeFilename = originalFilename.replace(/\.[^/.]+$/, '');
-
-      const uploadFilename = `uploads/${safeFilename}.csv`;
-      const { error: uploadError } = await this.supabase.storage
-        .from(this.BUCKET_NAME)
-        .upload(uploadFilename, fileBuffer, {
-          contentType: 'text/csv',
-          cacheControl: '3600',
-          upsert: true,
-        });
-
-      if (uploadError) {
-        throw new Error(`Failed to upload file: ${uploadError.message}`);
-      }
-
-      const result = await this.processCSVBuffer(
-        fileBuffer,
-        emailColumn,
-        firstNameColumn,
-        lastNameColumn,
-      );
-
-      const resultFilename = `${this.RESULTS_FOLDER}/${safeFilename}-results.json`;
-      await this.supabase.storage
-        .from(this.BUCKET_NAME)
-        .upload(resultFilename, JSON.stringify(result), {
-          contentType: 'application/json',
-          cacheControl: '3600',
-          upsert: true,
-        });
-
-      return result;
-    } catch (error) {
-      this.logger.error(`Error processing CSV: ${error.message}`);
-      throw error;
-    }
-  }
-
-  async getBucketPublicUrl(path: string): Promise<string | null> {
-    try {
-      const { data } = await this.supabase.storage
-        .from(this.BUCKET_NAME)
-        .getPublicUrl(path);
-
-      return data.publicUrl;
-    } catch (error) {
-      this.logger.error(`Error getting public URL: ${error.message}`);
-      return null;
-    }
-  }
-
-  async listFiles(): Promise<string[]> {
-    try {
-      const { data, error } = await this.supabase.storage
-        .from(this.BUCKET_NAME)
-        .list('uploads');
-
-      if (error) throw error;
-
-      return data.map((file) => file.name);
-    } catch (error) {
-      this.logger.error(`Error listing files: ${error.message}`);
-      throw error;
-    }
-  }
-
-  private async processCSVBuffer(
+  private async validateEmailColumn(
     buffer: Buffer,
-    emailColumn: string,
-    firstNameColumn: string,
-    lastNameColumn: string,
-  ): Promise<ProcessingResult> {
-    const result: ProcessingResult = {
-      validEmails: [],
-      emptyEmailRecords: [],
-      stats: {
-        totalProcessed: 0,
-        validEmailsCount: 0,
-        emptyEmailsCount: 0,
-        duplicateEmailsCount: 0,
-      },
+    emailColumnIndex: number,
+  ): Promise<string> {
+    return new Promise((resolve, reject) => {
+      let headerProcessed = false;
+
+      const parser = csv.parse({
+        skipEmptyLines: true,
+        trim: true,
+      });
+
+      parser.on('data', (row) => {
+        if (!headerProcessed) {
+          headerProcessed = true;
+          if (!Array.isArray(row) || row.length <= emailColumnIndex) {
+            reject(
+              new BadRequestException(
+                `Column index ${emailColumnIndex} does not exist in the CSV file`,
+              ),
+            );
+            return;
+          }
+
+          const columnName = row[emailColumnIndex]?.toString() || '';
+          if (!columnName.toLowerCase().includes('email')) {
+            reject(
+              new BadRequestException(
+                `Column at index ${emailColumnIndex} is not an email column. Found: ${columnName}`,
+              ),
+            );
+            return;
+          }
+
+          resolve(columnName);
+          parser.end();
+        }
+      });
+
+      parser.on('error', (error) => {
+        reject(
+          new BadRequestException(`Error validating CSV: ${error.message}`),
+        );
+      });
+
+      parser.write(buffer);
+      parser.end();
+    });
+  }
+
+  async previewCSV(
+    buffer: Buffer,
+    emailColumnIndex: number,
+  ): Promise<CsvPreviewStats> {
+    // First validate and get column name
+    const columnName = await this.validateEmailColumn(buffer, emailColumnIndex);
+
+    const stats = {
+      totalEmails: 0,
+      totalRows: 0,
+      totalEmptyEmails: 0,
+      totalDuplicateEmails: 0,
+      columnName: columnName, // Include column name in stats
     };
 
     const emailSet = new Set<string>();
@@ -162,31 +95,37 @@ export class CsvProcessorService {
     const processRow = new Transform({
       objectMode: true,
       transform(chunk, encoding, callback) {
-        result.stats.totalProcessed++;
+        stats.totalRows++;
 
-        const email = chunk[emailColumn]?.trim();
-        const firstName = chunk[firstNameColumn]?.trim();
-        const lastName = chunk[lastNameColumn]?.trim();
+        if (!Array.isArray(chunk) || chunk.length <= emailColumnIndex) {
+          callback(
+            new Error(`No data found at column index ${emailColumnIndex}`),
+          );
+          return;
+        }
 
-        if (!email) {
-          if (firstName || lastName) {
-            result.emptyEmailRecords.push({
-              first_name: firstName,
-              last_name: lastName,
-            });
-            result.stats.emptyEmailsCount++;
-          }
+        // Skip header row
+        if (stats.totalRows === 1) {
+          callback();
+          return;
+        }
+
+        const emailValue = chunk[emailColumnIndex];
+        const email = emailValue?.toString().trim() || '';
+
+        if (
+          !email ||
+          email === '' ||
+          email.toLowerCase() === 'null' ||
+          email.toLowerCase() === 'undefined'
+        ) {
+          stats.totalEmptyEmails++;
         } else {
-          if (emailSet.has(email)) {
-            result.stats.duplicateEmailsCount++;
+          if (emailSet.has(email.toLowerCase())) {
+            stats.totalDuplicateEmails++;
           } else {
-            emailSet.add(email);
-            result.validEmails.push({
-              email,
-              first_name: firstName,
-              last_name: lastName,
-            });
-            result.stats.validEmailsCount++;
+            emailSet.add(email.toLowerCase());
+            stats.totalEmails++;
           }
         }
 
@@ -198,85 +137,127 @@ export class CsvProcessorService {
       await pipelineAsync(
         Readable.from(buffer),
         csv.parse({
-          columns: true,
-          skip_empty_lines: true,
+          skipEmptyLines: false,
           trim: true,
+          from: 1,
         }),
         processRow,
       );
 
-      return result;
+      // Adjust totalRows to exclude header
+      stats.totalRows--;
+
+      return stats;
     } catch (error) {
-      throw new Error(`Error processing CSV buffer: ${error.message}`);
+      throw new Error(`Error previewing CSV: ${error.message}`);
     }
   }
 
-  async getProcessedResults(
-    filename: string,
-  ): Promise<ProcessingResult | null> {
+  async processAndStoreCSV(
+    fileBuffer: Buffer,
+    originalFilename: string,
+    options: ProcessingOptions,
+  ): Promise<Buffer> {
+    // First validate the email column
     try {
-      const safeFilename = filename.replace(/\.[^/.]+$/, '');
-      const resultFilename = `${this.RESULTS_FOLDER}/${safeFilename}-results.json`;
-
-      const { data, error } = await this.supabase.storage
-        .from('csv-files')
-        .download(resultFilename);
-
-      if (error) {
-        throw error;
-      }
-
-      const textDecoder = new TextDecoder('utf-8');
-      const jsonString = textDecoder.decode(await data.arrayBuffer());
-      return JSON.parse(jsonString);
+      await this.validateEmailColumn(fileBuffer, options.emailColumnIndex);
     } catch (error) {
-      this.logger.error(`Error fetching results: ${error.message}`);
-      return null;
+      throw error;
     }
-  }
 
-  async getOriginalFile(filename: string): Promise<Buffer | null> {
     try {
-      const safeFilename = filename.replace(/\.[^/.]+$/, '');
+      const processedRows: string[][] = [];
+      const headerRow: string[] = [];
+      let isHeader = true;
+      const pipelineAsync = promisify(pipeline);
+
+      const processRow = new Transform({
+        objectMode: true,
+        transform(chunk, encoding, callback) {
+          if (isHeader) {
+            headerRow.push(...chunk);
+            processedRows.push(chunk);
+            isHeader = false;
+            callback();
+            return;
+          }
+
+          if (
+            !Array.isArray(chunk) ||
+            chunk.length <= options.emailColumnIndex
+          ) {
+            callback(
+              new Error(
+                `No data found at column index ${options.emailColumnIndex}`,
+              ),
+            );
+            return;
+          }
+
+          const emailValue = chunk[options.emailColumnIndex];
+          const email = emailValue?.toString().trim() || '';
+
+          const isEmptyEmail =
+            !email ||
+            email === '' ||
+            email.toLowerCase() === 'null' ||
+            email.toLowerCase() === 'undefined';
+
+          if (!isEmptyEmail || !options.removeEmptyEmails) {
+            processedRows.push(chunk);
+          }
+
+          callback();
+        },
+      });
+
+      await pipelineAsync(
+        Readable.from(fileBuffer),
+        csv.parse({
+          skipEmptyLines: false,
+          trim: true,
+          from: 1,
+        }),
+        processRow,
+      );
+
+      const processedCsv = Buffer.from(
+        processedRows.map((row) => row.join(',')).join('\n'),
+      );
+
+      const safeFilename = originalFilename.replace(/\.[^/.]+$/, '');
       const uploadFilename = `uploads/${safeFilename}.csv`;
 
-      const { data, error } = await this.supabase.storage
+      const { error: uploadError } = await this.supabase.storage
         .from(this.BUCKET_NAME)
-        .download(uploadFilename);
+        .upload(uploadFilename, processedCsv, {
+          contentType: 'text/csv',
+          upsert: true,
+        });
 
-      if (error) {
-        throw error;
+      if (uploadError) {
+        throw new Error(`Failed to upload file: ${uploadError.message}`);
       }
 
-      return Buffer.from(await data.arrayBuffer());
+      return processedCsv;
     } catch (error) {
-      this.logger.error(`Error fetching original file: ${error.message}`);
-      return null;
+      this.logger.error(`Error processing CSV: ${error.message}`);
+      throw error;
     }
   }
 
-  async listUploadedFiles(): Promise<string[]> {
+  async downloadProcessedFile(filename: string): Promise<Buffer | null> {
     try {
       const { data, error } = await this.supabase.storage
         .from(this.BUCKET_NAME)
-        .list('uploads');
+        .download(`uploads/${filename}`);
 
       if (error) throw error;
 
-      const filteredFiles = data
-        .filter(
-          (file) =>
-            !file.name.startsWith('.') &&
-            file.name !== '.emptyFolderPlaceholder' &&
-            file.name !== '.keep' &&
-            file.name.endsWith('.csv'),
-        )
-        .map((file) => file.name);
-
-      return filteredFiles;
+      return Buffer.from(await data.arrayBuffer());
     } catch (error) {
-      this.logger.error(`Error listing uploaded files: ${error.message}`);
-      throw error;
+      this.logger.error(`Error downloading file: ${error.message}`);
+      return null;
     }
   }
   async testSupabaseConnection(): Promise<boolean> {

@@ -5,6 +5,8 @@ import { AppService } from './app.service';
 import { CsvProcessorModule } from './csv-processor/module/csv-processor.module';
 import { configuration } from './config/configuration';
 import { validationSchema } from './config/env.validation';
+import { MulterModule } from '@nestjs/platform-express';
+import { EmailValidatorModule } from './email-validator/email-validator.module';
 
 @Module({
   imports: [
@@ -16,7 +18,11 @@ import { validationSchema } from './config/env.validation';
         abortEarly: false,
       },
     }),
+    MulterModule.register({
+      dest: './uploads',
+    }),
     CsvProcessorModule,
+    EmailValidatorModule,
   ],
   controllers: [AppController],
   providers: [AppService],

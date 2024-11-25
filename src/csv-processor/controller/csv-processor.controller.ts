@@ -13,17 +13,16 @@ import {
   Res,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { CsvProcessorService } from '../service/csv-processor.service';
-import { MulterFile } from '../interfaces/csv-processor.interface';
 import { Response } from 'express';
+import { CsvProcessorService } from '../service/csv-processor.service';
 
 @Controller('csv-processor')
 export class CsvProcessorController {
   constructor(private readonly csvProcessorService: CsvProcessorService) {}
 
-  @Post('upload')
+  @Post('preview')
   @UseInterceptors(FileInterceptor('file'))
-  async uploadAndProcessCsv(
+  async previewCsv(
     @UploadedFile(
       new ParseFilePipe({
         validators: [
@@ -32,35 +31,66 @@ export class CsvProcessorController {
         ],
       }),
     )
-    file: MulterFile,
-    @Body('emailColumn') emailColumn: string = 'email',
-    @Body('firstNameColumn') firstNameColumn: string = 'first_name',
-    @Body('lastNameColumn') lastNameColumn: string = 'last_name',
+    file: Express.Multer.File,
+    @Body('emailColumnIndex') emailColumnIndex: string,
   ) {
     try {
-      const result = await this.csvProcessorService.processAndStoreCSV(
+      const columnIndex = parseInt(emailColumnIndex, 10);
+      if (isNaN(columnIndex) || columnIndex < 0) {
+        throw new BadRequestException('Invalid email column index');
+      }
+
+      const stats = await this.csvProcessorService.previewCSV(
         file.buffer,
-        file.originalname,
-        emailColumn,
-        firstNameColumn,
-        lastNameColumn,
+        columnIndex,
       );
 
       return {
         success: true,
-        message: 'CSV processing completed successfully',
+        stats,
         filename: file.originalname,
-        stats: {
-          totalProcessed: result.stats.totalProcessed,
-          validEmailsCount: result.stats.validEmailsCount,
-          emptyEmailsCount: result.stats.emptyEmailsCount,
-          duplicateEmailsCount: result.stats.duplicateEmailsCount,
-          fileSize: file.size,
+      };
+    } catch (error) {
+      throw new BadRequestException(
+        `Failed to preview CSV file: ${error.message}`,
+      );
+    }
+  }
+
+  @Post('process')
+  @UseInterceptors(FileInterceptor('file'))
+  async processAndStoreCsv(
+    @UploadedFile(
+      new ParseFilePipe({
+        validators: [
+          new MaxFileSizeValidator({ maxSize: 1024 * 1024 * 10 }),
+          new FileTypeValidator({ fileType: 'text/csv' }),
+        ],
+      }),
+    )
+    file: Express.Multer.File,
+    @Body('emailColumnIndex') emailColumnIndex: string,
+    @Body('removeEmptyEmails') removeEmptyEmails?: string,
+  ) {
+    try {
+      const columnIndex = parseInt(emailColumnIndex, 10);
+      if (isNaN(columnIndex) || columnIndex < 0) {
+        throw new BadRequestException('Invalid email column index');
+      }
+
+      const processedCsv = await this.csvProcessorService.processAndStoreCSV(
+        file.buffer,
+        file.originalname,
+        {
+          emailColumnIndex: columnIndex,
+          removeEmptyEmails: removeEmptyEmails === 'true',
         },
-        processedData: {
-          validEmails: result.validEmails,
-          emptyEmailRecords: result.emptyEmailRecords,
-        },
+      );
+
+      return {
+        success: true,
+        message: 'CSV processed and stored successfully',
+        filename: file.originalname,
       };
     } catch (error) {
       throw new BadRequestException(
@@ -69,41 +99,12 @@ export class CsvProcessorController {
     }
   }
 
-  @Get('results/:filename')
-  async getResults(@Param('filename') filename: string) {
-    const results =
-      await this.csvProcessorService.getProcessedResults(filename);
-    if (!results) {
-      throw new BadRequestException('Results not found');
-    }
-    return {
-      success: true,
-      data: results,
-    };
-  }
-
-  @Get('uploads')
-  async listUploadedFiles() {
-    const files = await this.csvProcessorService.listUploadedFiles();
-
-    return {
-      success: true,
-      files,
-      count: files.length,
-      isEmpty: files.length === 0,
-      message:
-        files.length === 0
-          ? 'No files uploaded yet'
-          : `Found ${files.length} file(s)`,
-    };
-  }
-
-  @Get('uploads/:filename')
-  async getOriginalFile(
+  @Get('download/:filename')
+  async downloadProcessedFile(
     @Param('filename') filename: string,
     @Res() res: Response,
   ) {
-    const file = await this.csvProcessorService.getOriginalFile(filename);
+    const file = await this.csvProcessorService.downloadProcessedFile(filename);
     if (!file) {
       throw new BadRequestException('File not found');
     }
