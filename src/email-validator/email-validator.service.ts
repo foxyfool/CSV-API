@@ -7,6 +7,8 @@ import {
 import { SupabaseClient } from '@supabase/supabase-js';
 import { parse } from 'csv-parse';
 import axios from 'axios';
+import { Worker } from 'worker_threads';
+import * as path from 'path';
 
 interface EmailValidationResponse {
   email: string;
@@ -15,14 +17,16 @@ interface EmailValidationResponse {
   provider: string;
 }
 
+interface EmailToProcess {
+  email: string;
+  rowIndex: number;
+  record: string[];
+}
 @Injectable()
 export class EmailValidatorService {
-  private readonly logger = new Logger(EmailValidatorService.name);
   private readonly BUCKET_NAME = 'csv-files';
-  private readonly API_URL =
-    'https://readytosend-api-production.up.railway.app/verify-email';
-  private readonly MAX_RETRIES = 3;
   private readonly EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  private readonly MAX_WORKERS = 4;
 
   constructor(
     @Inject('SUPABASE_CLIENT')
@@ -105,40 +109,60 @@ export class EmailValidatorService {
     }
   }
 
-  private async validateEmail(
-    email: string,
-    retries = 0,
-  ): Promise<EmailValidationResponse> {
-    try {
-      console.log(
-        `[Validation] Attempting email validation: ${email} (Attempt ${retries + 1}/${this.MAX_RETRIES + 1})`,
-      );
-      const response = await axios.get<EmailValidationResponse>(
-        `${this.API_URL}?email=${email}`,
-        { timeout: 10000 },
-      );
-      console.log(
-        `[Validation] Result for ${email}: ${response.data.email_status}`,
-      );
-      return response.data;
-    } catch (error) {
-      console.error(`[Validation] Error for ${email}: ${error.message}`);
+  private createWorker(emails: string[], workerId: number): Promise<any[]> {
+    console.log(
+      `[Main] Creating worker ${workerId} for ${emails.length} emails`,
+    );
 
-      if (retries < this.MAX_RETRIES) {
-        const delay = Math.min(Math.pow(2, retries) * 1000, 5000);
-        console.log(`[Validation] Retrying after ${delay}ms`);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        return this.validateEmail(email, retries + 1);
-      }
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(
+        path.resolve(__dirname, 'email-validator.worker.js'),
+        {
+          workerData: { emails, workerId },
+        },
+      );
 
-      console.error(`[Validation] Failed after all retries: ${email}`);
-      return {
-        email,
-        email_mx: 'error',
-        email_status: 'invalid',
-        provider: 'error',
-      };
-    }
+      worker.on('online', () => {
+        console.log(
+          `[Main] Worker ${workerId} is online and starting to process ${emails.length} emails`,
+        );
+      });
+
+      worker.on('message', (results) => {
+        console.log(
+          `[Main] Worker ${workerId} completed processing ${results.length} emails`,
+        );
+        resolve(results);
+      });
+
+      worker.on('error', (error) => {
+        console.error(
+          `[Main] Worker ${workerId} encountered error: ${error.message}`,
+        );
+        reject(error);
+      });
+
+      worker.on('exit', (code) => {
+        if (code !== 0) {
+          const errorMessage = `Worker ${workerId} stopped with exit code ${code}`;
+          console.error(`[Main] ${errorMessage}`);
+          reject(new Error(errorMessage));
+        } else {
+          console.log(`[Main] Worker ${workerId} finished successfully`);
+        }
+      });
+    });
+  }
+
+  private splitEmailsIntoChunks(
+    emails: string[],
+    numChunks: number,
+  ): string[][] {
+    const result: string[][] = Array.from({ length: numChunks }, () => []);
+    emails.forEach((email, index) => {
+      result[index % numChunks].push(email);
+    });
+    return result;
   }
 
   async validateEmailsInCsv(params: {
@@ -149,7 +173,6 @@ export class EmailValidatorService {
     fileId: string;
   }): Promise<{ message: string; status: string }> {
     console.log(`[Process] Starting validation for ${params.filename}`);
-    console.log(`[Process] Email column index: ${params.emailColumnIndex}`);
 
     try {
       const user = await this.verifyUserCredits(
@@ -158,13 +181,11 @@ export class EmailValidatorService {
       );
       let stats = { valid: 0, invalid: 0, unverifiable: 0, processed: 0 };
 
-      console.log(`[File] Fetching file from storage`);
       const { data: fileData, error: fetchError } = await this.supabase.storage
         .from(this.BUCKET_NAME)
         .download(`uploads/${params.filename}`);
 
       if (fetchError) {
-        console.error(`[File] Fetch error: ${fetchError.message}`);
         throw new Error(`Failed to fetch file: ${fetchError.message}`);
       }
 
@@ -177,10 +198,10 @@ export class EmailValidatorService {
       });
 
       const processedRows: string[] = [];
+      const emailsToProcess: EmailToProcess[] = [];
       let isFirstRow = true;
       let headers: string[] = [];
 
-      console.log(`[Process] Starting email validation`);
       for await (const record of records) {
         if (isFirstRow) {
           headers = record;
@@ -192,8 +213,6 @@ export class EmailValidatorService {
         }
 
         const email = record[params.emailColumnIndex];
-        console.log(`[Row] Processing email: ${email}`);
-
         if (
           !email ||
           email.trim() === '' ||
@@ -201,27 +220,57 @@ export class EmailValidatorService {
         ) {
           record.splice(params.emailColumnIndex + 1, 0, 'invalid');
           stats.invalid++;
+          processedRows.push(record.join(','));
         } else {
-          const validation = await this.validateEmail(email.trim());
-          record.splice(
-            params.emailColumnIndex + 1,
-            0,
-            validation.email_status,
-          );
-
-          if (validation.email_status === 'valid') stats.valid++;
-          else if (validation.email_status === 'invalid') stats.invalid++;
-          else stats.unverifiable++;
+          emailsToProcess.push({
+            email: email.trim(),
+            rowIndex: emailsToProcess.length,
+            record: [...record],
+          });
         }
+      }
+
+      // Split emails for parallel processing
+      const emailsOnly = emailsToProcess.map((item) => item.email);
+      const emailChunks = this.splitEmailsIntoChunks(
+        emailsOnly,
+        this.MAX_WORKERS,
+      );
+
+      console.log(
+        `[Process] Starting parallel validation with ${this.MAX_WORKERS} workers`,
+      );
+
+      const workerPromises = emailChunks.map((chunk, index) =>
+        this.createWorker(chunk, index + 1),
+      );
+
+      const results = await Promise.all(workerPromises);
+      const validationResults = results.flat();
+
+      try {
+        console.log(`[Process] Waiting for all workers to complete`);
+        const results = await Promise.all(workerPromises);
+        console.log(`[Process] All workers completed successfully`);
+        const validationResults = results.flat();
+      } catch (error) {
+        console.error(`[Process] Worker error: ${error.message}`);
+        throw error;
+      }
+
+      validationResults.forEach((result, index) => {
+        const { record, rowIndex } = emailsToProcess[index];
+        record.splice(params.emailColumnIndex + 1, 0, result.status);
+
+        if (result.status === 'valid') stats.valid++;
+        else if (result.status === 'invalid') stats.invalid++;
+        else stats.unverifiable++;
 
         stats.processed++;
         processedRows.push(record.join(','));
-        console.log(
-          `[Progress] Processed ${stats.processed}/${params.totalEmails} emails`,
-        );
-      }
+      });
 
-      console.log(`[File] Updating original file`);
+      // Update file in storage
       const finalCsv = processedRows.join('\n');
       const { error: uploadError } = await this.supabase.storage
         .from(this.BUCKET_NAME)
@@ -231,11 +280,10 @@ export class EmailValidatorService {
         });
 
       if (uploadError) {
-        console.error(`[File] Upload error: ${uploadError.message}`);
         throw new Error(`Failed to update file: ${uploadError.message}`);
       }
 
-      console.log(`[Database] Updating records`);
+      // Update database records
       await this.supabase.from('files').insert({
         file_id: params.fileId,
         created_at: new Date(),
@@ -252,7 +300,6 @@ export class EmailValidatorService {
         .update({ credits: user.credits - params.totalEmails })
         .eq('user_id', user.user_id);
 
-      console.log(`[Process] Validation completed successfully`);
       return {
         message: 'Validation completed successfully',
         status: 'Completed',
