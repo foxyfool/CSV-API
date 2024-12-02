@@ -12,3 +12,18 @@ export interface ValidationStats {
   noEmail: number;
   error: number;
 }
+
+export interface ValidationJob {
+  filename: string;
+  emailColumnIndex: number;
+  userEmail: string;
+  totalEmails: number;
+  fileId: string;
+}
+
+export interface ValidationResult {
+  email: string;
+  status: 'valid' | 'invalid';
+  mx: string;
+  provider: string;
+}

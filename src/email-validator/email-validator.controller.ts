@@ -8,6 +8,8 @@ import {
   Get,
   Inject,
 } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bull';
+import { Queue } from 'bull';
 import { EmailValidatorService } from './email-validator.service';
 import { v4 as uuidv4 } from 'uuid';
 import { SupabaseClient } from '@supabase/supabase-js';
@@ -20,7 +22,9 @@ export class EmailValidatorController {
     private readonly emailValidatorService: EmailValidatorService,
     @Inject('SUPABASE_CLIENT')
     private readonly supabase: SupabaseClient,
+    @InjectQueue('email-validation') private readonly emailQueue: Queue,
   ) {}
+
   @Post('validate/:filename')
   async validateEmails(
     @Param('filename') filename: string,
@@ -45,24 +49,44 @@ export class EmailValidatorController {
       );
 
       const fileId = uuidv4();
-      const result = await this.emailValidatorService.validateEmailsInCsv({
-        filename,
-        emailColumnIndex: columnIndex,
-        userEmail,
-        totalEmails,
-        fileId,
+
+      // Create initial file record
+      await this.supabase.from('files').insert({
+        file_id: fileId,
+        created_at: new Date(),
+        user_email: userEmail,
+        status: 'In Queue',
+        object_storage_id: `uploads/${filename}`,
+        total_emails: totalEmails,
       });
 
+      // Add job to queue instead of direct processing
+      const job = await this.emailQueue.add(
+        'validate',
+        {
+          filename,
+          emailColumnIndex: columnIndex,
+          userEmail,
+          totalEmails,
+          fileId,
+        },
+        {
+          jobId: fileId,
+          removeOnComplete: false, // Keep job data for status checking
+        },
+      );
+
       this.logger.log(
-        `Email validation initiated successfully for file: ${filename}`,
+        `Email validation job queued successfully for file: ${filename}`,
       );
 
       return {
         success: true,
-        message: result.message,
+        message: 'Validation job queued successfully',
         file_id: fileId,
-        status: result.status,
+        status: 'In Queue',
         filename: filename,
+        job_id: job.id,
       };
     } catch (error) {
       this.logger.error(
@@ -79,21 +103,40 @@ export class EmailValidatorController {
 
   @Get('status/:fileId')
   async checkValidationStatus(@Param('fileId') fileId: string) {
-    const { data, error } = await this.supabase
-      .from('files')
-      .select('*')
-      .eq('file_id', fileId)
-      .single();
+    try {
+      const job = await this.emailQueue.getJob(fileId);
 
-    if (error) {
-      throw new BadRequestException('Failed to fetch file status');
+      // Get file status from database
+      const { data, error } = await this.supabase
+        .from('files')
+        .select('*')
+        .eq('file_id', fileId)
+        .single();
+
+      if (error) {
+        throw new BadRequestException('Failed to fetch file status');
+      }
+
+      // Get job progress
+      const progress = job ? await job.progress() : 0;
+
+      let queuePosition = null;
+      if (job && (await job.isWaiting())) {
+        const waiting = await this.emailQueue.getWaiting();
+        queuePosition = waiting.findIndex((j) => j.id === job.id) + 1;
+      }
+
+      return {
+        status: data.status,
+        stats: data.stats,
+        progress: progress,
+        queue_position: queuePosition,
+        total_emails: data.total_emails,
+        processed_emails: data.stats?.processed || 0,
+      };
+    } catch (error) {
+      throw new BadRequestException('Failed to fetch validation status');
     }
-
-    return {
-      status: data.status, // Will be 'In Queue', 'Validating', or 'Completed'
-      stats: data.stats, // Contains counts of valid/invalid emails
-      progress: (data.stats.processed / data.stats.total_emails) * 100, // Percentage complete
-    };
   }
 
   private validateColumnIndex(emailColumnIndex: string): number {
