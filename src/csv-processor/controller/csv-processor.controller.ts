@@ -77,8 +77,7 @@ export class CsvProcessorController {
     try {
       const columnIndex = this.validateColumnIndex(emailColumnIndex);
 
-      // Pass the buffer directly
-      await this.csvProcessorService.processAndStoreCSV(
+      const uniqueFilename = await this.csvProcessorService.processAndStoreCSV(
         file.buffer,
         file.originalname,
         {
@@ -90,7 +89,7 @@ export class CsvProcessorController {
       return {
         success: true,
         message: 'CSV processed and stored successfully',
-        filename: file.originalname,
+        filename: uniqueFilename,
       };
     } catch (error) {
       if (error instanceof BadRequestException) {

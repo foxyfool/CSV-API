@@ -1,22 +1,10 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { Logger } from '@nestjs/common';
-import { rateLimit } from 'express-rate-limit';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule);
-
-  app.use(
-    rateLimit({
-      windowMs: 15 * 60 * 1000,
-      max: 100,
-      message:
-        'Too many requests from this IP, please try again after 15 minutes',
-      standardHeaders: true,
-      legacyHeaders: false,
-    }),
-  );
 
   app.enableShutdownHooks();
 
