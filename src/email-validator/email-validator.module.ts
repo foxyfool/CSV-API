@@ -10,32 +10,12 @@ import { createClient } from '@supabase/supabase-js';
   imports: [
     BullModule.forRootAsync({
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => {
-        const redisUrl = configService.get('redis.url');
-
-        // Configure Redis connection based on environment
-        const redisConfig = redisUrl
-          ? { url: redisUrl }
-          : {
-              // For local
-              host: configService.get('redis.host', 'localhost'),
-              port: configService.get('redis.port', 6379),
-              password: configService.get('redis.password'),
-            };
-
-        return {
-          redis: redisConfig,
-          defaultJobOptions: {
-            removeOnComplete: false,
-            attempts: configService.get('queue.maxAttempts', 3),
-            timeout: configService.get('queue.timeout', 300000),
-            backoff: {
-              type: 'exponential',
-              delay: 2000,
-            },
-          },
-        };
-      },
+      useFactory: (configService: ConfigService) => ({
+        redis: {
+          host: 'localhost',
+          port: 6379,
+        },
+      }),
     }),
     BullModule.registerQueue({
       name: 'email-validation',

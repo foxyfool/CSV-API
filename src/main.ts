@@ -13,7 +13,7 @@ async function bootstrap() {
 
   logger.log(`Application running on port ${port}`);
   logger.log(
-    `Redis queue configured on ${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || '6379'}`,
+    `Redis queue configured on ${process.env.REDIS_HOST}:${process.env.REDIS_PORT}`,
   );
 }
 bootstrap();

@@ -7,7 +7,6 @@ export interface EnvironmentVariables {
   QUEUE_CONCURRENT_JOBS: number;
   QUEUE_MAX_ATTEMPTS: number;
   QUEUE_TIMEOUT: number;
-  REDIS_URL?: string;
 }
 
 export const configuration = () => ({
@@ -16,15 +15,9 @@ export const configuration = () => ({
     key: process.env.SUPABASE_KEY,
   },
   redis: {
-    // If REDIS_URL exists (Render), use it; otherwise use individual configs
-    url: process.env.REDIS_URL,
-    host: !process.env.REDIS_URL
-      ? process.env.REDIS_HOST || 'localhost'
-      : undefined,
-    port: !process.env.REDIS_URL
-      ? parseInt(process.env.REDIS_PORT || '6379', 10)
-      : undefined,
-    password: !process.env.REDIS_URL ? process.env.REDIS_PASSWORD : undefined,
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379', 10),
+    password: process.env.REDIS_PASSWORD,
   },
   queue: {
     concurrentJobs: parseInt(process.env.QUEUE_CONCURRENT_JOBS || '4', 10),

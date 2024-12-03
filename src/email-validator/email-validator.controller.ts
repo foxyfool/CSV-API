@@ -32,8 +32,9 @@ export class EmailValidatorController {
     @Body('user_email') userEmail: string,
     @Body('total_emails') totalEmails: number,
   ) {
-    this.logger.log(`Received request to validate emails in file: ${filename}`);
-    this.logger.log(`Provided email column index: ${emailColumnIndex}`);
+    // Check if queue is connected
+    const isQueueReady = await this.emailQueue.isReady();
+    console.log('[Queue] Queue ready status:', isQueueReady);
 
     try {
       const columnIndex = this.validateColumnIndex(emailColumnIndex);

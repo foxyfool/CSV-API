@@ -175,17 +175,20 @@ export class EmailValidatorService {
     console.log(`[Process] Starting validation for ${params.filename}`);
 
     try {
+      console.log(`[Credits] Checking credits for ${params.userEmail}`);
       const user = await this.verifyUserCredits(
         params.userEmail,
         params.totalEmails,
       );
       let stats = { valid: 0, invalid: 0, unverifiable: 0, processed: 0 };
 
+      console.log(`[File] Attempting to fetch file from storage`);
       const { data: fileData, error: fetchError } = await this.supabase.storage
         .from(this.BUCKET_NAME)
         .download(`uploads/${params.filename}`);
 
       if (fetchError) {
+        console.error(`[File] Fetch error:`, fetchError);
         throw new Error(`Failed to fetch file: ${fetchError.message}`);
       }
 
