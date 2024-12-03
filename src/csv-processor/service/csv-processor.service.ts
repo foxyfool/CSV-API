@@ -13,6 +13,7 @@ import {
   CsvPreviewStats,
   ProcessingOptions,
 } from '../interfaces/csv-processor.interface';
+import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
 export class CsvProcessorService {
@@ -156,12 +157,10 @@ export class CsvProcessorService {
     buffer: Buffer,
     originalFilename: string,
     options: ProcessingOptions,
-  ): Promise<void> {
+  ): Promise<string> {
     try {
-      // Validate the email column first
       await this.validateEmailColumn(buffer, options.emailColumnIndex);
 
-      // Create a fresh stream for processing
       const input = this.createStreamFromBuffer(buffer);
 
       const processedRows: string[][] = [];
@@ -211,8 +210,9 @@ export class CsvProcessorService {
         processedRows.map((row) => row.join(',')).join('\n'),
       );
 
-      const safeFilename = originalFilename.replace(/\.[^/.]+$/, '');
-      const uploadFilename = `uploads/${safeFilename}.csv`;
+      const safeFilename = originalFilename.replace(/\.[^/.]+$/, ''); // Remove the extension
+      const uniqueFilename = `${safeFilename}-${uuidv4()}.csv`; // Append UUID to the filename
+      const uploadFilename = `uploads/${uniqueFilename}`;
 
       const { error: uploadError } = await this.supabase.storage
         .from(this.BUCKET_NAME)
@@ -224,6 +224,8 @@ export class CsvProcessorService {
       if (uploadError) {
         throw new Error(`Failed to upload file: ${uploadError.message}`);
       }
+
+      return uniqueFilename; // Return the unique filename
     } catch (error) {
       this.logger.error(`Error processing CSV: ${error.message}`);
       throw error;
