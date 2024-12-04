@@ -32,9 +32,11 @@ export class EmailValidatorController {
     @Body('user_email') userEmail: string,
     @Body('total_emails') totalEmails: number,
   ) {
-    // Check if queue is connected
     const isQueueReady = await this.emailQueue.isReady();
-    console.log('[Queue] Queue ready status:', isQueueReady);
+
+    if (!isQueueReady) {
+      throw new BadRequestException('Email validation queue is not ready');
+    }
 
     try {
       const columnIndex = this.validateColumnIndex(emailColumnIndex);
