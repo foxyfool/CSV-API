@@ -18,17 +18,14 @@ export const configuration = () => {
   }
 
   try {
-    // Parse the URL using URL class
     const url = new URL(redisUrl);
 
-    // Extract credentials and connection details
     const username = url.username || 'default';
     const password = url.password;
     const host = url.hostname;
     const port = parseInt(url.port, 10);
 
     console.log('Parsed Redis config:', {
-      // Debug log
       host,
       port,
       username,
@@ -55,7 +52,7 @@ export const configuration = () => {
       },
     };
   } catch (error) {
-    console.error('Error parsing Redis URL:', error); // Debug log
+    console.error('Error parsing Redis URL:', error);
     throw new Error(`Failed to parse Redis URL: ${error.message}`);
   }
 };
