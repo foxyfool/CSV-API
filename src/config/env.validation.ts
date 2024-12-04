@@ -5,10 +5,9 @@ export const validationSchema = Joi.object({
   SUPABASE_URL: Joi.string().required(),
   SUPABASE_KEY: Joi.string().required(),
 
-  // Redis config
   REDIS_URL: Joi.string().optional(),
-  REDIS_HOST: Joi.string().optional(),
-  REDIS_PORT: Joi.number().optional(),
+  REDIS_HOST: Joi.string().default('localhost'),
+  REDIS_PORT: Joi.number().default(6379),
   REDIS_PASSWORD: Joi.string().optional().allow(''),
 
   // Queue config
