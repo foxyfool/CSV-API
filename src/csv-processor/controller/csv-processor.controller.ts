@@ -77,19 +77,21 @@ export class CsvProcessorController {
     try {
       const columnIndex = this.validateColumnIndex(emailColumnIndex);
 
-      const uniqueFilename = await this.csvProcessorService.processAndStoreCSV(
-        file.buffer,
-        file.originalname,
-        {
-          emailColumnIndex: columnIndex,
-          removeEmptyEmails: removeEmptyEmails === 'true',
-        },
-      );
+      const { fullFilename, emailsFilename } =
+        await this.csvProcessorService.processAndStoreCSV(
+          file.buffer,
+          file.originalname,
+          {
+            emailColumnIndex: columnIndex,
+            removeEmptyEmails: removeEmptyEmails === 'true',
+          },
+        );
 
       return {
         success: true,
         message: 'CSV processed and stored successfully',
-        filename: uniqueFilename,
+        fullFilename,
+        emailsFilename,
       };
     } catch (error) {
       if (error instanceof BadRequestException) {
@@ -100,7 +102,6 @@ export class CsvProcessorController {
       );
     }
   }
-
   private validateColumnIndex(emailColumnIndex: string): number {
     const columnIndex = parseInt(emailColumnIndex, 10);
     if (isNaN(columnIndex) || columnIndex < 0) {

@@ -9,7 +9,7 @@ async function validateEmail(email: string, retries = 0): Promise<any> {
   console.log(`[Worker ${threadId}] Processing email: ${email}`);
   try {
     const response = await axios.get(`${API_URL}?email=${email}`, {
-      timeout: 10000,
+      timeout: 100000000,
     });
     console.log(`[Worker ${threadId}] Successfully validated: ${email}`);
     return {

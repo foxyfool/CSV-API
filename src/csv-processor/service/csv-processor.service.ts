@@ -26,7 +26,6 @@ export class CsvProcessorService {
     private readonly supabase: SupabaseClient,
   ) {}
 
-  // Create a buffer to stream converter that can be reused
   private createStreamFromBuffer(buffer: Buffer): Readable {
     return Readable.from(buffer);
   }
@@ -38,12 +37,10 @@ export class CsvProcessorService {
       ...options,
     });
   }
-
   private async validateEmailColumn(
     buffer: Buffer,
     emailColumnIndex: number,
   ): Promise<string> {
-    // Create a fresh stream for validation
     const input = this.createStreamFromBuffer(buffer);
 
     return new Promise<string>((resolve, reject) => {
@@ -157,20 +154,23 @@ export class CsvProcessorService {
     buffer: Buffer,
     originalFilename: string,
     options: ProcessingOptions,
-  ): Promise<string> {
+  ): Promise<{ fullFilename: string; emailsFilename: string }> {
     try {
       await this.validateEmailColumn(buffer, options.emailColumnIndex);
-
       const input = this.createStreamFromBuffer(buffer);
-
-      const processedRows: string[][] = [];
+      const processedFullRows: string[][] = [];
+      const processedEmailRows: string[][] = [];
       let headerProcessed = false;
 
       const processRow = new Transform({
         objectMode: true,
         transform(chunk: string[], encoding: string, callback: Function) {
           if (!headerProcessed) {
-            processedRows.push(chunk);
+            processedEmailRows.push(['email']);
+            const fullHeaders = chunk.filter(
+              (_, index) => index !== options.emailColumnIndex,
+            );
+            processedFullRows.push(fullHeaders);
             headerProcessed = true;
             callback();
             return;
@@ -197,7 +197,11 @@ export class CsvProcessorService {
             email.toLowerCase() === 'undefined';
 
           if (!isEmptyEmail || !options.removeEmptyEmails) {
-            processedRows.push(chunk);
+            processedEmailRows.push([email]);
+            const rowWithoutEmail = chunk.filter(
+              (_, index) => index !== options.emailColumnIndex,
+            );
+            processedFullRows.push(rowWithoutEmail);
           }
 
           callback();
@@ -206,26 +210,44 @@ export class CsvProcessorService {
 
       await this.pipelineAsync(input, this.createParser(), processRow);
 
-      const processedCsv = Buffer.from(
-        processedRows.map((row) => row.join(',')).join('\n'),
+      const uuid = uuidv4();
+      const safeFilename = originalFilename.replace(/\.[^/.]+$/, '');
+      const fullFilename = `${safeFilename}_full_${uuid}.csv`;
+      const emailsFilename = `${safeFilename}_emails_${uuid}.csv`;
+
+      const fullCsv = Buffer.from(
+        processedFullRows.map((row) => row.join(',')).join('\n'),
+      );
+      const emailsCsv = Buffer.from(
+        processedEmailRows.map((row) => row.join(',')).join('\n'),
       );
 
-      const safeFilename = originalFilename.replace(/\.[^/.]+$/, ''); // Remove the extension
-      const uniqueFilename = `${safeFilename}-${uuidv4()}.csv`; // Append UUID to the filename
-      const uploadFilename = `uploads/${uniqueFilename}`;
+      // Add retry logic for uploads
+      const uploadWithRetry = async (filename: string, data: Buffer) => {
+        for (let i = 0; i < 3; i++) {
+          const { error } = await this.supabase.storage
+            .from(this.BUCKET_NAME)
+            .upload(`uploads/${filename}`, data, {
+              contentType: 'text/csv',
+              upsert: true,
+            });
 
-      const { error: uploadError } = await this.supabase.storage
-        .from(this.BUCKET_NAME)
-        .upload(uploadFilename, processedCsv, {
-          contentType: 'text/csv',
-          upsert: true,
-        });
+          if (!error) {
+            await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait for 1s after successful upload
+            return;
+          }
 
-      if (uploadError) {
-        throw new Error(`Failed to upload file: ${uploadError.message}`);
-      }
+          if (i < 2) await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait between retries
+        }
+        throw new Error('Failed to upload file after 3 attempts');
+      };
 
-      return uniqueFilename; // Return the unique filename
+      await Promise.all([
+        uploadWithRetry(fullFilename, fullCsv),
+        uploadWithRetry(emailsFilename, emailsCsv),
+      ]);
+
+      return { fullFilename, emailsFilename };
     } catch (error) {
       this.logger.error(`Error processing CSV: ${error.message}`);
       throw error;
