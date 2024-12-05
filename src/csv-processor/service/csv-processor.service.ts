@@ -5,160 +5,105 @@ import {
   Logger,
 } from '@nestjs/common';
 import { SupabaseClient } from '@supabase/supabase-js';
-import { parse, Options as CsvOptions, Parser } from 'csv-parse';
-import { Transform, pipeline } from 'stream';
-import { promisify } from 'util';
-import { Readable } from 'stream';
+import * as Papa from 'papaparse';
+import { v4 as uuidv4 } from 'uuid';
 import {
   CsvPreviewStats,
   ProcessingOptions,
 } from '../interfaces/csv-processor.interface';
-import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
 export class CsvProcessorService {
   private readonly logger = new Logger(CsvProcessorService.name);
   private readonly BUCKET_NAME = 'csv-files';
-  private readonly pipelineAsync = promisify(pipeline);
 
   constructor(
     @Inject('SUPABASE_CLIENT')
     private readonly supabase: SupabaseClient,
   ) {}
 
-  private createStreamFromBuffer(buffer: Buffer): Readable {
-    return Readable.from(buffer);
-  }
-
-  private createParser(options: Partial<CsvOptions> = {}): Parser {
-    return parse({
-      skipEmptyLines: true,
-      trim: true,
-      ...options,
-    });
-  }
-
   private async validateEmailColumn(
-    buffer: Buffer,
+    content: string,
     emailColumnIndex: number,
   ): Promise<{ columnName: string; hasInconsistentColumns: boolean }> {
-    const input = this.createStreamFromBuffer(buffer);
-    let hasInconsistentColumns = false;
-
-    return new Promise((resolve, reject) => {
-      let isResolved = false;
-      let headerLength = 0;
-
-      const headerValidator = new Transform({
-        objectMode: true,
-        transform(row: string[], encoding: string, callback: Function) {
-          if (isResolved) {
-            // Check subsequent rows for inconsistent column counts
-            if (row.length !== headerLength) {
-              hasInconsistentColumns = true;
-            }
-            callback();
-            return;
-          }
-
-          if (!Array.isArray(row) || row.length <= emailColumnIndex) {
-            callback(
-              new BadRequestException(
-                `Column index ${emailColumnIndex} does not exist in the CSV file`,
-              ),
-            );
-            return;
-          }
-
-          headerLength = row.length;
-          const columnName = row[emailColumnIndex]?.toString() || '';
-          if (!columnName.toLowerCase().includes('email')) {
-            callback(
-              new BadRequestException(
-                `Column at index ${emailColumnIndex} is not an email column. Found: ${columnName}`,
-              ),
-            );
-            return;
-          }
-
-          isResolved = true;
-          resolve({ columnName, hasInconsistentColumns });
-          callback();
-        },
-      });
-
-      this.pipelineAsync(input, this.createParser(), headerValidator).catch(
-        reject,
-      );
+    const parseResult = Papa.parse(content, {
+      delimiter: ',',
+      skipEmptyLines: true,
+      quoteChar: '"',
+      header: false,
     });
+
+    const rows = parseResult.data as string[][];
+    if (!rows.length) {
+      throw new BadRequestException('CSV file is empty');
+    }
+
+    const headerRow = rows[0];
+    if (!Array.isArray(headerRow) || headerRow.length <= emailColumnIndex) {
+      throw new BadRequestException(
+        `Column index ${emailColumnIndex} does not exist in the CSV file`,
+      );
+    }
+
+    const columnName = headerRow[emailColumnIndex]?.toString() || '';
+    if (!columnName.toLowerCase().includes('email')) {
+      throw new BadRequestException(
+        `Column at index ${emailColumnIndex} is not an email column. Found: ${columnName}`,
+      );
+    }
+
+    const hasInconsistentColumns = rows.some(
+      (row) => row.length !== headerRow.length,
+    );
+
+    return { columnName, hasInconsistentColumns };
   }
 
   async previewCSV(
     buffer: Buffer,
     emailColumnIndex: number,
   ): Promise<CsvPreviewStats> {
-    // First validate the email column
+    const content = buffer.toString('utf8');
     const { columnName } = await this.validateEmailColumn(
-      buffer,
+      content,
       emailColumnIndex,
     );
 
-    // Create a fresh stream for processing
-    const input = this.createStreamFromBuffer(buffer);
+    const parseResult = Papa.parse(content, {
+      delimiter: ',',
+      skipEmptyLines: true,
+      quoteChar: '"',
+      header: false,
+    });
 
+    const rows = parseResult.data as string[][];
     const stats: CsvPreviewStats = {
       totalEmails: 0,
-      totalRows: 0,
+      totalRows: rows.length - 1, // Excluding header
       totalEmptyEmails: 0,
       totalDuplicateEmails: 0,
       columnName,
     };
 
     const emailSet = new Set<string>();
+    rows.slice(1).forEach((row) => {
+      const email = (row[emailColumnIndex]?.toString() || '')
+        .trim()
+        .toLowerCase();
 
-    const processRow = new Transform({
-      objectMode: true,
-      transform(chunk: string[], encoding: string, callback: Function) {
-        if (stats.totalRows === 0) {
-          stats.totalRows++;
-          callback();
-          return;
-        }
-
-        if (!Array.isArray(chunk) || chunk.length <= emailColumnIndex) {
-          callback(
-            new Error(`No data found at column index ${emailColumnIndex}`),
-          );
-          return;
-        }
-
-        stats.totalRows++;
-        const email = (chunk[emailColumnIndex]?.toString() || '')
-          .trim()
-          .toLowerCase();
-
-        if (!email || email === 'null' || email === 'undefined') {
-          stats.totalEmptyEmails++;
+      if (!email || email === 'null' || email === 'undefined') {
+        stats.totalEmptyEmails++;
+      } else {
+        if (emailSet.has(email)) {
+          stats.totalDuplicateEmails++;
         } else {
-          if (emailSet.has(email)) {
-            stats.totalDuplicateEmails++;
-          } else {
-            emailSet.add(email);
-            stats.totalEmails++;
-          }
+          emailSet.add(email);
+          stats.totalEmails++;
         }
-
-        callback();
-      },
+      }
     });
 
-    try {
-      await this.pipelineAsync(input, this.createParser(), processRow);
-
-      return stats;
-    } catch (error) {
-      throw new Error(`Error previewing CSV: ${error.message}`);
-    }
+    return stats;
   }
 
   async processAndStoreCSV(
@@ -171,67 +116,55 @@ export class CsvProcessorService {
     warning?: string;
   }> {
     try {
-      const { columnName, hasInconsistentColumns } =
-        await this.validateEmailColumn(buffer, options.emailColumnIndex);
+      const content = buffer.toString('utf8');
+      const { hasInconsistentColumns } = await this.validateEmailColumn(
+        content,
+        options.emailColumnIndex,
+      );
 
-      const input = this.createStreamFromBuffer(buffer);
-      const processedFullRows: string[][] = [];
-      const processedEmailRows: string[][] = [['email']];
-      let headerProcessed = false;
-
-      const processRow = new Transform({
-        objectMode: true,
-        transform(chunk: string[], encoding: string, callback: Function) {
-          try {
-            if (!headerProcessed) {
-              const fullHeaders = chunk.filter(
-                (_, index) => index !== options.emailColumnIndex,
-              );
-              processedFullRows.push(fullHeaders);
-              headerProcessed = true;
-              callback();
-              return;
-            }
-
-            const email =
-              chunk[options.emailColumnIndex]?.toString()?.trim() || '';
-            const isEmptyEmail =
-              !email ||
-              email.toLowerCase() === 'null' ||
-              email.toLowerCase() === 'undefined';
-
-            if (!isEmptyEmail || !options.removeEmptyEmails) {
-              processedEmailRows.push([email]);
-              const rowWithoutEmail = chunk.filter(
-                (_, index) => index !== options.emailColumnIndex,
-              );
-              processedFullRows.push(rowWithoutEmail);
-            }
-
-            callback();
-          } catch (error) {
-            // If there's an error processing a row, log it but continue
-            console.warn(`Error processing row: ${error.message}`);
-            callback();
-          }
-        },
+      const parseResult = Papa.parse(content, {
+        delimiter: ',',
+        skipEmptyLines: true,
+        quoteChar: '"',
+        header: false,
       });
 
-      await this.pipelineAsync(input, this.createParser(), processRow);
+      const records = parseResult.data as string[][];
+      const updatedFullRows: string[][] = [];
+      const emailRows: string[][] = [];
+      emailRows.push(['email']);
+
+      records.forEach((row, index) => {
+        if (index === 0) {
+          updatedFullRows.push(
+            row.filter((_, colIndex) => colIndex !== options.emailColumnIndex),
+          );
+          return;
+        }
+
+        const email = row[options.emailColumnIndex]?.toString().trim() || '';
+        const isEmptyEmail =
+          !email ||
+          email.toLowerCase() === 'null' ||
+          email.toLowerCase() === 'undefined';
+
+        if (!isEmptyEmail || !options.removeEmptyEmails) {
+          emailRows.push([email]);
+          const updatedRow = row.filter(
+            (_, colIndex) => colIndex !== options.emailColumnIndex,
+          );
+          updatedFullRows.push(updatedRow);
+        }
+      });
 
       const uuid = uuidv4();
       const safeFilename = originalFilename.replace(/\.[^/.]+$/, '');
       const fullFilename = `${safeFilename}_full_${uuid}.csv`;
       const emailsFilename = `${safeFilename}_emails_${uuid}.csv`;
 
-      const fullCsv = Buffer.from(
-        processedFullRows.map((row) => row.join(',')).join('\n'),
-      );
-      const emailsCsv = Buffer.from(
-        processedEmailRows.map((row) => row.join(',')).join('\n'),
-      );
+      const fullCsv = Papa.unparse(updatedFullRows);
+      const emailsCsv = Papa.unparse(emailRows);
 
-      // Add retry logic for uploads
       const uploadWithRetry = async (filename: string, data: Buffer) => {
         for (let i = 0; i < 3; i++) {
           const { error } = await this.supabase.storage
@@ -242,35 +175,34 @@ export class CsvProcessorService {
             });
 
           if (!error) {
-            await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait for 1s after successful upload
+            await new Promise((resolve) => setTimeout(resolve, 1000));
             return;
           }
 
-          if (i < 2) await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait between retries
+          if (i < 2) await new Promise((resolve) => setTimeout(resolve, 2000));
         }
         throw new Error('Failed to upload file after 3 attempts');
       };
 
       await Promise.all([
-        uploadWithRetry(fullFilename, fullCsv),
-        uploadWithRetry(emailsFilename, emailsCsv),
+        uploadWithRetry(fullFilename, Buffer.from(fullCsv)),
+        uploadWithRetry(emailsFilename, Buffer.from(emailsCsv)),
       ]);
 
-      const result: {
-        fullFilename: string;
-        emailsFilename: string;
-        warning?: string;
-      } = {
+      const uploadResult = {
         fullFilename,
         emailsFilename,
-      };
+      } as const;
 
       if (hasInconsistentColumns) {
-        result.warning =
-          'The CSV file has inconsistent column counts. The extracted emails are available, but the full file may be malformed.';
+        return {
+          ...uploadResult,
+          warning:
+            'The CSV file has inconsistent column counts. The extracted emails are available, but the full file may be malformed.',
+        };
       }
 
-      return result;
+      return uploadResult;
     } catch (error) {
       this.logger.error(`Error processing CSV: ${error.message}`);
       throw error;
