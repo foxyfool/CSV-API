@@ -31,6 +31,8 @@ export class EmailValidatorController {
     @Body('emailColumnIndex') emailColumnIndex: string,
     @Body('user_email') userEmail: string,
     @Body('total_emails') totalEmails: number,
+    @Body('full_filename') fullFilename: string, // Add these parameters
+    @Body('emails_filename') emailsFilename: string, // Add these parameters
   ) {
     const isQueueReady = await this.emailQueue.isReady();
 
@@ -63,7 +65,7 @@ export class EmailValidatorController {
         total_emails: totalEmails,
       });
 
-      // Add job to queue instead of direct processing
+      // Add job to queue with the split file information
       const job = await this.emailQueue.add(
         'validate',
         {
@@ -72,15 +74,13 @@ export class EmailValidatorController {
           userEmail,
           totalEmails,
           fileId,
+          fullFilename, // Add to job data
+          emailsFilename, // Add to job data
         },
         {
           jobId: fileId,
-          removeOnComplete: false, // Keep job data for status checking
+          removeOnComplete: false,
         },
-      );
-
-      this.logger.log(
-        `Email validation job queued successfully for file: ${filename}`,
       );
 
       return {
@@ -103,7 +103,6 @@ export class EmailValidatorController {
       );
     }
   }
-
   @Get('status/:fileId')
   async checkValidationStatus(@Param('fileId') fileId: string) {
     try {

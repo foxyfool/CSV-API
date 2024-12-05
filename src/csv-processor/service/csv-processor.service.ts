@@ -37,19 +37,26 @@ export class CsvProcessorService {
       ...options,
     });
   }
+
   private async validateEmailColumn(
     buffer: Buffer,
     emailColumnIndex: number,
-  ): Promise<string> {
+  ): Promise<{ columnName: string; hasInconsistentColumns: boolean }> {
     const input = this.createStreamFromBuffer(buffer);
+    let hasInconsistentColumns = false;
 
-    return new Promise<string>((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       let isResolved = false;
+      let headerLength = 0;
 
       const headerValidator = new Transform({
         objectMode: true,
         transform(row: string[], encoding: string, callback: Function) {
           if (isResolved) {
+            // Check subsequent rows for inconsistent column counts
+            if (row.length !== headerLength) {
+              hasInconsistentColumns = true;
+            }
             callback();
             return;
           }
@@ -63,6 +70,7 @@ export class CsvProcessorService {
             return;
           }
 
+          headerLength = row.length;
           const columnName = row[emailColumnIndex]?.toString() || '';
           if (!columnName.toLowerCase().includes('email')) {
             callback(
@@ -74,7 +82,7 @@ export class CsvProcessorService {
           }
 
           isResolved = true;
-          resolve(columnName);
+          resolve({ columnName, hasInconsistentColumns });
           callback();
         },
       });
@@ -90,7 +98,10 @@ export class CsvProcessorService {
     emailColumnIndex: number,
   ): Promise<CsvPreviewStats> {
     // First validate the email column
-    const columnName = await this.validateEmailColumn(buffer, emailColumnIndex);
+    const { columnName } = await this.validateEmailColumn(
+      buffer,
+      emailColumnIndex,
+    );
 
     // Create a fresh stream for processing
     const input = this.createStreamFromBuffer(buffer);
@@ -154,57 +165,55 @@ export class CsvProcessorService {
     buffer: Buffer,
     originalFilename: string,
     options: ProcessingOptions,
-  ): Promise<{ fullFilename: string; emailsFilename: string }> {
+  ): Promise<{
+    fullFilename: string;
+    emailsFilename: string;
+    warning?: string;
+  }> {
     try {
-      await this.validateEmailColumn(buffer, options.emailColumnIndex);
+      const { columnName, hasInconsistentColumns } =
+        await this.validateEmailColumn(buffer, options.emailColumnIndex);
+
       const input = this.createStreamFromBuffer(buffer);
       const processedFullRows: string[][] = [];
-      const processedEmailRows: string[][] = [];
+      const processedEmailRows: string[][] = [['email']];
       let headerProcessed = false;
 
       const processRow = new Transform({
         objectMode: true,
         transform(chunk: string[], encoding: string, callback: Function) {
-          if (!headerProcessed) {
-            processedEmailRows.push(['email']);
-            const fullHeaders = chunk.filter(
-              (_, index) => index !== options.emailColumnIndex,
-            );
-            processedFullRows.push(fullHeaders);
-            headerProcessed = true;
+          try {
+            if (!headerProcessed) {
+              const fullHeaders = chunk.filter(
+                (_, index) => index !== options.emailColumnIndex,
+              );
+              processedFullRows.push(fullHeaders);
+              headerProcessed = true;
+              callback();
+              return;
+            }
+
+            const email =
+              chunk[options.emailColumnIndex]?.toString()?.trim() || '';
+            const isEmptyEmail =
+              !email ||
+              email.toLowerCase() === 'null' ||
+              email.toLowerCase() === 'undefined';
+
+            if (!isEmptyEmail || !options.removeEmptyEmails) {
+              processedEmailRows.push([email]);
+              const rowWithoutEmail = chunk.filter(
+                (_, index) => index !== options.emailColumnIndex,
+              );
+              processedFullRows.push(rowWithoutEmail);
+            }
+
             callback();
-            return;
+          } catch (error) {
+            // If there's an error processing a row, log it but continue
+            console.warn(`Error processing row: ${error.message}`);
+            callback();
           }
-
-          if (
-            !Array.isArray(chunk) ||
-            chunk.length <= options.emailColumnIndex
-          ) {
-            callback(
-              new Error(
-                `No data found at column index ${options.emailColumnIndex}`,
-              ),
-            );
-            return;
-          }
-
-          const email = (
-            chunk[options.emailColumnIndex]?.toString() || ''
-          ).trim();
-          const isEmptyEmail =
-            !email ||
-            email.toLowerCase() === 'null' ||
-            email.toLowerCase() === 'undefined';
-
-          if (!isEmptyEmail || !options.removeEmptyEmails) {
-            processedEmailRows.push([email]);
-            const rowWithoutEmail = chunk.filter(
-              (_, index) => index !== options.emailColumnIndex,
-            );
-            processedFullRows.push(rowWithoutEmail);
-          }
-
-          callback();
         },
       });
 
@@ -247,7 +256,21 @@ export class CsvProcessorService {
         uploadWithRetry(emailsFilename, emailsCsv),
       ]);
 
-      return { fullFilename, emailsFilename };
+      const result: {
+        fullFilename: string;
+        emailsFilename: string;
+        warning?: string;
+      } = {
+        fullFilename,
+        emailsFilename,
+      };
+
+      if (hasInconsistentColumns) {
+        result.warning =
+          'The CSV file has inconsistent column counts. The extracted emails are available, but the full file may be malformed.';
+      }
+
+      return result;
     } catch (error) {
       this.logger.error(`Error processing CSV: ${error.message}`);
       throw error;
@@ -268,6 +291,7 @@ export class CsvProcessorService {
       return null;
     }
   }
+
   async testSupabaseConnection(): Promise<boolean> {
     try {
       const { data, error } = await this.supabase.auth.getSession();
