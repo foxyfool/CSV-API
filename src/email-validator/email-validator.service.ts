@@ -9,6 +9,7 @@ import { parse } from 'csv-parse';
 import axios from 'axios';
 import { Worker } from 'worker_threads';
 import * as path from 'path';
+import e from 'express';
 
 interface EmailValidationResponse {
   email: string;
@@ -171,109 +172,112 @@ export class EmailValidatorService {
     userEmail: string;
     totalEmails: number;
     fileId: string;
+    fullFilename: string;
+    emailsFilename: string;
   }): Promise<{ message: string; status: string }> {
-    console.log(`[Process] Starting validation for ${params.filename}`);
-
     try {
-      console.log(`[Credits] Checking credits for ${params.userEmail}`);
       const user = await this.verifyUserCredits(
         params.userEmail,
         params.totalEmails,
       );
       let stats = { valid: 0, invalid: 0, unverifiable: 0, processed: 0 };
 
-      console.log(`[File] Attempting to fetch file from storage`);
-      const { data: fileData, error: fetchError } = await this.supabase.storage
-        .from(this.BUCKET_NAME)
-        .download(`uploads/${params.filename}`);
+      // Fetch both files
+      const [{ data: emailsData }, { data: fullData }] = await Promise.all([
+        this.supabase.storage
+          .from(this.BUCKET_NAME)
+          .download(`uploads/${params.emailsFilename}`),
+        this.supabase.storage
+          .from(this.BUCKET_NAME)
+          .download(`uploads/${params.fullFilename}`),
+      ]);
 
-      if (fetchError) {
-        console.error(`[File] Fetch error:`, fetchError);
-        throw new Error(`Failed to fetch file: ${fetchError.message}`);
+      if (!emailsData || !fullData) {
+        throw new Error('Failed to fetch files');
       }
 
-      const buffer = Buffer.from(await fileData.arrayBuffer());
-      const records = parse(buffer.toString(), {
+      // Parse both files
+      const emailsBuffer = Buffer.from(await emailsData.arrayBuffer());
+      const fullBuffer = Buffer.from(await fullData.arrayBuffer());
+
+      const emailsRecords = parse(emailsBuffer.toString(), {
         delimiter: ',',
         trim: true,
         skip_empty_lines: true,
         columns: false,
       });
 
-      const processedRows: string[] = [];
-      const emailsToProcess: EmailToProcess[] = [];
-      let isFirstRow = true;
-      let headers: string[] = [];
+      const fullRecords = parse(fullBuffer.toString(), {
+        delimiter: ',',
+        trim: true,
+        skip_empty_lines: true,
+        columns: false,
+      });
 
-      for await (const record of records) {
-        if (isFirstRow) {
-          headers = record;
-          this.validateEmailColumn(headers, params.emailColumnIndex);
-          record.splice(params.emailColumnIndex + 1, 0, 'Email_Validation');
-          processedRows.push(record.join(','));
-          isFirstRow = false;
+      // Process emails
+      const emailsToProcess: string[] = [];
+      let skipFirstRow = true;
+
+      for await (const record of emailsRecords) {
+        if (skipFirstRow) {
+          skipFirstRow = false;
           continue;
         }
-
-        const email = record[params.emailColumnIndex];
-        if (
-          !email ||
-          email.trim() === '' ||
-          ['null', 'undefined'].includes(email.toLowerCase())
-        ) {
-          record.splice(params.emailColumnIndex + 1, 0, 'invalid');
-          stats.invalid++;
-          processedRows.push(record.join(','));
-        } else {
-          emailsToProcess.push({
-            email: email.trim(),
-            rowIndex: emailsToProcess.length,
-            record: [...record],
-          });
+        if (record[0] && record[0].trim()) {
+          emailsToProcess.push(record[0].trim());
         }
       }
 
-      // Split emails for parallel processing
-      const emailsOnly = emailsToProcess.map((item) => item.email);
+      // Process emails using workers
       const emailChunks = this.splitEmailsIntoChunks(
-        emailsOnly,
+        emailsToProcess,
         this.MAX_WORKERS,
       );
-
-      console.log(
-        `[Process] Starting parallel validation with ${this.MAX_WORKERS} workers`,
-      );
-
       const workerPromises = emailChunks.map((chunk, index) =>
         this.createWorker(chunk, index + 1),
       );
 
-      const results = await Promise.all(workerPromises);
-      const validationResults = results.flat();
-
+      let validationResults: any[] = [];
       try {
-        console.log(`[Process] Waiting for all workers to complete`);
         const results = await Promise.all(workerPromises);
-        console.log(`[Process] All workers completed successfully`);
-        const validationResults = results.flat();
+        validationResults = results.flat();
       } catch (error) {
-        console.error(`[Process] Worker error: ${error.message}`);
         throw error;
       }
 
-      validationResults.forEach((result, index) => {
-        const { record, rowIndex } = emailsToProcess[index];
-        record.splice(params.emailColumnIndex + 1, 0, result.status);
+      // Prepare final file content
+      const processedRows: string[] = [];
+      skipFirstRow = true;
+      let validationIndex = 0;
 
-        if (result.status === 'valid') stats.valid++;
-        else if (result.status === 'invalid') stats.invalid++;
-        else stats.unverifiable++;
+      for await (const fullRecord of fullRecords) {
+        if (skipFirstRow) {
+          // Add headers for email and validation
+          fullRecord.splice(params.emailColumnIndex, 0, 'Email');
+          fullRecord.splice(params.emailColumnIndex + 1, 0, 'Email_Validation');
+          processedRows.push(fullRecord.join(','));
+          skipFirstRow = false;
+          continue;
+        }
 
-        stats.processed++;
-        processedRows.push(record.join(','));
-      });
+        if (validationIndex < validationResults.length) {
+          const result = validationResults[validationIndex];
+          // Add email and validation result
+          fullRecord.splice(params.emailColumnIndex, 0, result.email);
+          fullRecord.splice(params.emailColumnIndex + 1, 0, result.status);
 
-      // Update file in storage
+          if (result.status === 'valid') stats.valid++;
+          else if (result.status === 'invalid') stats.invalid++;
+          else stats.unverifiable++;
+
+          stats.processed++;
+          validationIndex++;
+        }
+
+        processedRows.push(fullRecord.join(','));
+      }
+
+      // Write back to original file
       const finalCsv = processedRows.join('\n');
       const { error: uploadError } = await this.supabase.storage
         .from(this.BUCKET_NAME)
@@ -286,43 +290,37 @@ export class EmailValidatorService {
         throw new Error(`Failed to update file: ${uploadError.message}`);
       }
 
-      // Update database records
-      await this.supabase.from('files').insert({
-        file_id: params.fileId,
-        created_at: new Date(),
-        user_id: user.user_id,
-        user_email: params.userEmail,
-        stats,
-        status: 'Completed',
-        credits_consumed: params.totalEmails,
-        object_storage_id: `uploads/${params.filename}`,
-      });
-
-      await this.supabase
-        .from('users')
-        .update({ credits: user.credits - params.totalEmails })
-        .eq('user_id', user.user_id);
+      // Update database records and cleanup
+      await Promise.all([
+        this.supabase.from('files').insert({
+          file_id: params.fileId,
+          created_at: new Date(),
+          user_id: user.user_id,
+          user_email: params.userEmail,
+          stats,
+          status: 'Completed',
+          credits_consumed: params.totalEmails,
+          object_storage_id: `uploads/${params.filename}`,
+        }),
+        this.supabase
+          .from('users')
+          .update({ credits: user.credits - params.totalEmails })
+          .eq('user_id', user.user_id),
+        // Cleanup split files
+        this.supabase.storage
+          .from(this.BUCKET_NAME)
+          .remove([
+            `uploads/${params.fullFilename}`,
+            `uploads/${params.emailsFilename}`,
+          ]),
+      ]);
 
       return {
         message: 'Validation completed successfully',
         status: 'Completed',
       };
     } catch (error) {
-      console.error(`[Process] Error: ${error.message}`);
-
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-
-      await this.supabase.from('files').insert({
-        file_id: params.fileId,
-        created_at: new Date(),
-        user_email: params.userEmail,
-        stats: { error: error.message },
-        status: 'Error',
-        object_storage_id: `uploads/${params.filename}`,
-      });
-
+      console.error(`[Validation] Error occurred: ${error.message}`);
       throw error;
     }
   }

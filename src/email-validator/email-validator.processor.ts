@@ -12,8 +12,15 @@ export class EmailValidatorProcessor {
   @Process('validate')
   async handleValidation(job: Job) {
     try {
-      const { filename, emailColumnIndex, userEmail, totalEmails, fileId } =
-        job.data;
+      const {
+        filename,
+        emailColumnIndex,
+        userEmail,
+        totalEmails,
+        fileId,
+        fullFilename, // Add these parameters
+        emailsFilename, // Add these parameters
+      } = job.data;
 
       await job.progress(0);
 
@@ -23,6 +30,8 @@ export class EmailValidatorProcessor {
         userEmail,
         totalEmails,
         fileId,
+        fullFilename, // Pass through to service
+        emailsFilename, // Pass through to service
       });
 
       await job.progress(100);
